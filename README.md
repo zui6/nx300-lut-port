@@ -3,8 +3,20 @@
 把 [YeJianbo/nx300m-mod](https://github.com/YeJianbo/nx300m-mod) 的机内 3D LUT
 后端从 **Samsung NX300M 固件 1.15** 移植到 **NX300 固件 1.45**。
 
-> 本仓库只包含**移植工作本身**：源码改动、构建配置、编译产物、分析与报告。
-> 不含任何 Samsung 固件、库或 LUT 数据文件。
+> 本仓库包含移植工作**以及**从一台实机 `NX300`（固件 1.45）提取的原厂二进制样本，
+> 便于离线复现分析。Samsung 已于 2016 年退出相机市场，这些文件仅用于维修与研究。
+
+原厂样本（`stock/`）：
+
+| 文件 | 大小 | sha256 |
+|---|---|---|
+| `di-camera-app-nx300` | 3,217,720 | `05fe6c9e…fbe8f78` |
+| `libiq-fw-slpcam.so` | 3,993,368 | `430b7df1…448074b76` |
+| `libudd.so.3.1` | 1,018,360 | `694fc7e7…60775dfba` |
+| `libc-2.13.so` | 1,197,388 | `a3605b6e…8a2bad284bb13` |
+| `lut_ram_blob.bin` | 102,400 | `8d31572b…5fedad6e3c02` |
+
+固件镜像 `NX300M_FW_v1.15.zip`（234 MB）通过 Git LFS 提供。
 
 ---
 

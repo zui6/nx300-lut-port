@@ -1,3 +1,5 @@
 * text=auto eol=lf
 *.arm binary
 *.so binary
+*.bin binary
+stock/* binary
