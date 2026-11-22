@@ -1,0 +1,75 @@
+name: build-nx300-lut-loader
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi qemu-user
+
+      - name: Show toolchain
+        run: |
+          arm-linux-gnueabi-gcc --version | head -1
+          arm-linux-gnueabi-ld --version | head -1
+
+      - name: ABI probe (compile-time + qemu)
+        run: |
+          cat > /tmp/probe.c <<'PROBE_EOF'
+          #include <stdio.h>
+          #include <time.h>
+          #include <sys/stat.h>
+          #include <unistd.h>
+          #include <sys/syscall.h>
+          /* compile-time checks: must match glibc 2.13 ABI */
+          char _a[sizeof(time_t) == 4 ? 1 : -1];
+          char _b[sizeof(struct timespec) == 8 ? 1 : -1];
+          int main(void) {
+            printf("time_t=%zu timespec=%zu\n", sizeof(time_t), sizeof(struct timespec));
+            struct timespec ts;
+            if (clock_gettime(CLOCK_MONOTONIC, &ts)) { puts("clock_gettime FAILED"); return 1; }
+            printf("clock_gettime tv_sec=%ld tv_nsec=%ld\n", (long)ts.tv_sec, (long)ts.tv_nsec);
+            struct timespec t2;
+            long r = syscall(263, CLOCK_MONOTONIC, &t2);
+            printf("syscall263 ret=%ld tv_sec=%ld tv_nsec=%ld\n", r, (long)t2.tv_sec, (long)t2.tv_nsec);
+            if (r != 0 || t2.tv_sec < 0 || t2.tv_sec > 100000000) { puts("SYSCALL263 ABI BROKEN"); return 2; }
+            puts("ABI OK");
+            return 0;
+          }
+          PROBE_EOF
+          arm-linux-gnueabi-gcc -D_TIME_BITS=32 -D_FILE_OFFSET_BITS=64 -std=gnu99 /tmp/probe.c -o /tmp/probe
+          echo "compile-time ABI assertions passed"
+          qemu-arm -L /usr/arm-linux-gnueabi /tmp/probe
+
+      - name: Build loader
+        run: |
+          set -x
+          arm-linux-gnueabi-gcc \
+            -std=gnu99 -O2 -Wall -Wextra \
+            -march=armv7-a -mfloat-abi=soft \
+            -D_TIME_BITS=32 -D_FILE_OFFSET_BITS=64 \
+            -fno-stack-protector -fno-pic -no-pie \
+            -nostdlib -nostartfiles -Wl,-e,_start \
+            -Wl,--dynamic-linker=/lib/ld-linux.so.3 \
+            -Wl,-z,defs \
+            -I. \
+            lut_live_loader.c crt0_arm.S ./libc-2.13.so -lgcc \
+            -o lut_live_loader.arm
+
+      - name: Verify
+        run: |
+          file lut_live_loader.arm || true
+          arm-linux-gnueabi-readelf -h -A -d -V lut_live_loader.arm
+          echo "--- size ---"; stat -c%s lut_live_loader.arm
+          echo "--- sha256 ---"; sha256sum lut_live_loader.arm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nx300-lut-loader
+          path: lut_live_loader.arm
