@@ -16,7 +16,14 @@
 | `libc-2.13.so` | 1,197,388 | `a3605b6e…8a2bad284bb13` |
 | `lut_ram_blob.bin` | 102,400 | `8d31572b…5fedad6e3c02` |
 
-固件镜像 `NX300M_FW_v1.15.zip`（234 MB）通过 Git LFS 提供。
+固件镜像不随本仓库分发，请从 nxfiles 下载：
+
+- **NX300M 1.15**：<https://nxfiles.ydns.eu/files/NX300M/Firmware/NX300M_FW_v1.15.zip>
+  （245,016,220 字节，SLP 容器头 `SLP\0 1.15 NX300M NX300MGLUANL1`）
+- 固件目录：<https://nxfiles.ydns.eu/files/NX300M/Firmware/>
+
+> 注：该镜像内层经压缩/加密，未直接包含可提取的 cramfs/squashfs 或 ARM ELF，
+> 因此本次移植是**基于实机运行态证据**完成的，而非固件静态解包（见 `docs/01`）。
 
 ---
 
