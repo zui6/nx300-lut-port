@@ -380,8 +380,28 @@ void nx_lut_ram_update(void *self,void *params) {
 __attribute__((visibility("hidden")))
 void nx_lut_ram_ipcs(unsigned channel,const u16 *source) {
     void (*original)(unsigned,const u16 *)=(void *)nx_lut_ram_config.original_ipcs;
+    if(!nx_lut_ram_config.enabled) {original(channel,source);return;}
     u32 tid=(u32)sys3(224,0,0,0);struct context *s=0;
     for(unsigned i=0;i<SLOTS;i++) if(contexts[i].tid==tid) {s=&contexts[i];break;}
+    /* NX300 1.45: this symbol has a second GOT slot, in libcapture, reached only
+     * from CDDWrapperIPCS_B2Y::SetIQParam_3D_LUT (0x15b650 -> 0x15b650+0x74), the
+     * liveview 3D-LUT table write.  That call runs on a thread which never
+     * executes the vtable hook, so the update-side context lookup always missed
+     * and the preview silently forwarded the stock table.  Bind a context to the
+     * calling thread on first use; it is kept for the process lifetime because
+     * selection() is stamp-cached and this path is per-frame-ish, not per-call
+     * file I/O.  The slot count is still the shared SLOTS bound, so a runaway
+     * thread population cannot exhaust it silently. */
+    if(!s) {
+        for(unsigned i=0;i<SLOTS;i++) if(__sync_bool_compare_and_swap(&contexts[i].tid,0,tid)) {s=&contexts[i];break;}
+        if(s) {
+            selection(s);
+            table_caches[s-contexts][0].hit=0;
+            table_caches[s-contexts][1].hit=0;
+            s->source_branch=0;s->order_count=0;s->trace_enabled=(u32)tracing();
+            s->stat_updates++;
+        }
+    }
     if(!s || channel>=3 || !source) {unmatched(tid,channel,source);original(channel,source);return;}
     if(s->order_count<3) s->channel_order[s->order_count]=channel;
     s->order_count++;s->writer_tids[channel]=tid;s->source_ptrs[channel]=(u32)source;
