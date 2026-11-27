@@ -1,0 +1,21 @@
+{
+  "magic": 1314409538,
+  "abi": 1,
+  "blob_size": 102400,
+  "code_size": 16384,
+  "data_offset": 16384,
+  "data_size": 86016,
+  "update_entry": 64,
+  "ipcs_entry": 6748,
+  "config_offset": 16384,
+  "config_size": 196,
+  "contexts_offset": 16580,
+  "context_stride": 9120,
+  "context_count": 8,
+  "binary": "/home/runner/work/nx300-lut-blob/nx300-lut-blob/out/lut_ram_blob.bin",
+  "no_runtime_relocations": true,
+  "no_libc": true,
+  "target_executed": false,
+  "build": 3723920501,
+  "config_abi_bytes": 196
+}

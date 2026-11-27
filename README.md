@@ -34,9 +34,32 @@
 | 原厂模块指纹（libiq / libudd / libc / 主程序） | ✅ 通过 |
 | `dynamic_abi` / `code_bytes` 校验 | ✅ 通过 |
 | RAM blob admission | ✅ 通过 |
-| ptrace attach + 远程 `mmap2` | ✅ 通过 |
-| 写 GOT / vtable | ⚠️ **执行后相机崩溃重启** |
+| ptrace attach（71 线程） | ✅ 通过 |
+| 远程 `mmap2` / 写入 10 万字节 / `cacheflush` / `mprotect` | ✅ 通过 |
+| 写 GOT / vtable | ✅ 通过 |
+| `detach_all()` 恢复全部线程 | ✅ 通过 |
+| **hook 被相机调用时的行为** | ⚠️ **未验证**（见下） |
 | LUT 实际生效 | ❌ 未验证 |
+
+实测 `apply` 完整日志：
+
+```
+Still control admission: full_hash elapsed_ms=2.231s cache_hits=0 hashed_files=4; camera running
+STAGE mmap2
+STAGE private-map-copy
+STAGE cacheflush
+STAGE mprotect
+STAGE state-and-slot-commit
+STAGE slot-commit
+Still target stop window: 0.339s; file verification ran before attach.
+```
+
+**整个 attach + 注入 + detach 只用了 339 毫秒**，所有阶段执行完毕。
+
+唯一未确认的是「hook 被调用时会不会崩」：`CIpcParameterNode::Update`
+只在相机**操作面板 / 切换 LUT 参数**时才触发，自动化测试期间没人碰相机，
+因此 blob 里埋的探针（`/mnt/mmc/lut-hook-entered`）没有出现——
+这是**预期行为，不能据此判定安装失败**。
 
 **相机没有变砖**：所有改动只落在 SD 卡、`/tmp`（tmpfs）和运行时内存，
 崩溃后重启即恢复；拔掉 SD 卡完全回到原厂状态。
@@ -87,15 +110,22 @@
 ```
 build/
   lut_live_loader.c              # 改写为 NX300 地址的 loader
-  live_loader_core.h             # 含两处修复：liveview 判定、syscall_stop
+  live_loader_core.h             # liveview 判定、syscall_stop、时钟三处修复
   lut_live_stock.h               # 自动生成的指纹常量
   crt0_arm.S                     # 自写 ARM 入口（原仓库缺此文件）
   lut_ram_blob.h                 # blob 结构定义
-  lut_ram_blob_build.h           # blob 构建 ID
+  lut_ram_blob_build.h           # blob 构建 ID（须与 blob/lut_ram_blob.bin 一致）
   smartfilter_admission_cache.h
-  build.yml                      # GitHub Actions 工作流（含 ABI 探针）
-  lut_live_loader.arm            # 编译产物（源码级移植版）
+  build.yml                      # GitHub Actions：loader 构建（含 ABI 探针）
+  lut_live_loader.arm            # 编译产物，72,084 B
   lut_live_loader_binarypatch.arm# 另一条路线：直接 patch 原二进制的产物
+blob/
+  lut_ram_blob.c                 # RAM blob 源码（已改为 trace 写 SD + fsync）
+  lut_ram_blob.h / .ld           # 结构与零地址链接脚本
+  build_lut_ram_blob.py          # blob 构建脚本（clang --target=arm-linux-gnueabi）
+  blob.yml                       # GitHub Actions：blob 构建
+  lut_ram_blob.bin               # 产物，102,400 B，build tag 3723920501
+  lut_ram_blob.json              # 构建报告
 docs/
   01-feasibility.md              # 机理分析：rc=75 真因、指纹锁全景
   02-binary-patch.md             # 二进制补丁路线（16 处 / 227 字节）

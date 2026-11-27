@@ -1,0 +1,40 @@
+﻿name: build-nx300-lut-blob
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang/lld + pyelftools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld
+          pip install --quiet pyelftools
+          clang --version | head -1
+          ld.lld --version | head -1
+
+      - name: Build RAM blob
+        run: |
+          python3 tools/build_lut_ram_blob.py --output-dir out
+
+      - name: Report
+        run: |
+          ls -l out
+          cat out/lut_ram_blob.json
+          echo "--- build header ---"
+          cat runtime/lut_ram_blob_build.h
+          echo "--- sizes ---"
+          stat -c '%n %s' out/lut_ram_blob.bin
+          sha256sum out/lut_ram_blob.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nx300-lut-blob
+          path: |
+            out/lut_ram_blob.bin
+            out/lut_ram_blob.json
+            runtime/lut_ram_blob_build.h

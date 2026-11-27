@@ -79,9 +79,30 @@ static int threads(unsigned pid,struct thread *out,unsigned *count) {
     if(errno)ok=0;
     closedir(d);if(!n)return 0;qsort(out,n,sizeof *out,thread_cmp);*count=n;return ok;
 }
+/* NX300 1.45 clock.
+ *
+ * Three approaches failed on device:
+ *   1. variadic syscall(263, CLOCK_MONOTONIC, &ts)
+ *   2. clock_gettime()
+ *   3. inline svc for __NR_clock_gettime
+ * (2) also cannot link, because glibc 2.13 keeps clock_gettime in librt and
+ * this loader is linked -nostdlib against libc alone. All three reported
+ * absurd stamps on this kernel ("target stop window: 1898375544832 ms").
+ * A bad clock makes the supervisor deadline expire immediately, so it kills
+ * the tracer while target TIDs are ptrace-stopped and the camera freezes.
+ *
+ * gettimeofday is a fixed-argument libc/vDSO call already present in the
+ * camera's libc, and only the delta between two stamps matters here. */
 static unsigned long long core_now_ms(void) {
-    struct timespec ts;if(syscall(263,CLOCK_MONOTONIC,&ts))return 0;
-    return (unsigned long long)ts.tv_sec*1000+(unsigned)ts.tv_nsec/1000000;
+    struct timeval tv;if(gettimeofday(&tv,NULL))return 0;
+    return (unsigned long long)tv.tv_sec*1000+(unsigned long long)tv.tv_usec/1000;
+}
+/* NX300 1.45: %llu through this GCC-14/libc-2.13 variadic boundary printed a
+ * fixed bogus value ("stop window: 1464583848354 ms") on every run. Print the
+ * 64-bit millisecond count as two %u halves instead, which marshals safely. */
+static const char *ms_text(char *buf,unsigned size,unsigned long long ms) {
+    snprintf(buf,size,"%u.%03us",(unsigned)(ms/1000ULL),(unsigned)(ms%1000ULL));
+    return buf;
 }
 static int liveview_comm_count(unsigned pid,const char *wanted,unsigned *count) {
     char path[64],line[128];snprintf(path,sizeof path,"/proc/%u/task",pid);
@@ -198,8 +219,9 @@ static int transaction_poisoned;
 static volatile sig_atomic_t abort_requested;
 static void request_abort(int sig) {(void)sig;abort_requested=1;}
 static unsigned long long now_ms(void) {
-    struct timespec ts;if(syscall(263,CLOCK_MONOTONIC,&ts))return 0;
-    return (unsigned long long)ts.tv_sec*1000+(unsigned)ts.tv_nsec/1000000;
+    /* Same gettimeofday clock as core_now_ms; see the note there. */
+    struct timeval tv;if(gettimeofday(&tv,NULL))return 0;
+    return (unsigned long long)tv.tv_sec*1000+(unsigned long long)tv.tv_usec/1000;
 }
 static int wait_stop(struct stopped *s,unsigned timeout) {
     unsigned long long deadline=now_ms()+timeout;

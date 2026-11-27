@@ -31,6 +31,7 @@
 #include <sys/vfs.h>
 #include <signal.h>
 #include <time.h>
+#include <sys/time.h>
 #include "lut_ram_blob.h"
 #include "lut_live_stock.h"
 #include "lut_ram_blob_build.h"
@@ -253,8 +254,8 @@ static int mutate(unsigned pid,const char *command,const char *blob_path,const c
        __fxstat64(3,iq.fd,&iq_file)||__fxstat64(3,udd.fd,&udd_file)||__fxstat64(3,libc.fd,&libc_file))goto done;
     admission_cache_save();
     iq_map=*iq.first;udd_map=*udd.first;libc_map=*libc.first;
-    fprintf(stderr,"Still control admission: %s elapsed_ms=%llu cache_hits=%u hashed_files=%u; camera running\n",
-        admission_cache_hits?"cached_file_identity":"full_hash",now_ms()-admission_at,admission_cache_hits,admission_cache_misses);
+    char msbuf[32];fprintf(stderr,"Still control admission: %s elapsed_ms=%s cache_hits=%u hashed_files=%u; camera running\n",
+        admission_cache_hits?"cached_file_identity":"full_hash",ms_text(msbuf,sizeof msbuf,now_ms()-admission_at),admission_cache_hits,admission_cache_misses);
     if(abort_requested)goto done;
     stopped_at=now_ms();
     if(!attach_all(pid)){fprintf(stderr,"Thread admission/attach failed; no slot write.\n");goto done;}
@@ -353,28 +354,28 @@ static int mutate(unsigned pid,const char *command,const char *blob_path,const c
     }
     memcpy(blob+h.config_offset,&cfg,sizeof cfg);
     uint32_t size=(h.data_offset+h.data_size+4095)&~4095U,args[6]={0,size,3,0x22,0xffffffff,0},region;
-    stage="mmap2";
+    stage="mmap2";fprintf(stderr,"STAGE %s\n",stage);
     int called=remote_syscall(main_thread,libc.bias+STOCK_SVC,192,args,&region);
     if(!called||kernel_error(region)||region%4096){free(blob);goto done;}
     owned_region=region;owned_size=size;
-    stage="private-map-copy";
+    stage="private-map-copy";fprintf(stderr,"STAGE %s\n",stage);
     if(!load_maps(pid)||!cover(region,size,1,0)){free(blob);goto done;}
     int wrote=poke(pid,region,blob,h.blob_size);free(blob);if(!wrote)goto done;
     uint32_t result;uint32_t flush[6]={region,region+h.code_size,0,0,0,0};
-    stage="cacheflush";
+    stage="cacheflush";fprintf(stderr,"STAGE %s\n",stage);
     if(!remote_syscall(main_thread,libc.bias+STOCK_SVC,0xf0002,flush,&result)||kernel_error(result))goto done;
     uint32_t protect[6]={region,h.code_size,5,0,0,0};
-    stage="mprotect";
+    stage="mprotect";fprintf(stderr,"STAGE %s\n",stage);
     if(!remote_syscall(main_thread,libc.bias+STOCK_SVC,125,protect,&result)||kernel_error(result))goto done;
     if(!load_maps(pid)||!cover(region,h.code_size,0,1)||!cover(region+h.data_offset,h.data_size,1,0))goto done;
     state.magic=NX_LUT_RAM_MAGIC;state.abi=1;state.pid=pid;state.start=start;state.iq=iq.bias;state.udd=udd.bias;
     state.region=region;state.length=size;state.update=region+h.update_entry;state.ipcs=region+h.ipcs_entry;state.config=region+h.config_offset;
     state.contexts=region+h.reserved[0];state.stride=h.reserved[1];state.count=h.reserved[2];
-    stage="state-and-slot-commit";
+    stage="state-and-slot-commit";fprintf(stderr,"STAGE %s\n",stage);
     if(abort_requested||!write_state(path,&state))goto done;
     state_written=1;
 commit_slots:
-    stage="slot-commit";
+    stage="slot-commit";fprintf(stderr,"STAGE %s\n",stage);
     if(!poke(pid,slot_a,&state.update,4))goto done;
     patched=1;
     if(!poke(pid,slot_b,&state.ipcs,4))goto done;
@@ -402,7 +403,7 @@ done:
     if(libc.fd>=0)close(libc.fd);
     if(transaction_poisoned){clear_markers(pid);fprintf(stderr,"FATAL: context recovery incomplete; no success claimed.\n");return 5;}
     if(!detach_all()){clear_markers(pid);fprintf(stderr,"FATAL: not all TIDs detached.\n");return 5;}
-    if(stopped_at)fprintf(stderr,"Still target stop window: %llu ms; file verification ran before attach.\n",now_ms()-stopped_at);
+    if(stopped_at){char msbuf2[32];fprintf(stderr,"Still target stop window: %s ms; file verification ran before attach.\n",ms_text(msbuf2,sizeof msbuf2,now_ms()-stopped_at));}
     if(known&&!rc){state_path(pid,path,sizeof path);unlink(path);}
     if(restoring||rc)clear_markers(pid);
     if(restoring&&!rc)printf("{\"command\":\"restore\",\"pid\":%u,\"restored\":true,\"mapping_retained\":true,\"cache_invalidated\":%s,\"ready\":false,\"image_verified\":false}\n",pid,restore_cache?"true":"false");
@@ -416,6 +417,10 @@ done:
             fprintf(status,"{\"command\":\"apply\",\"pid\":%u,\"hooks_installed\":true,\"ready\":true,\"build\":%u,\"loader\":\"ram-blob\"}",pid,NX_LUT_BLOB_BUILD);
             fclose(status);
         } else fprintf(stderr,"Initial telemetry publication failed errno=%d; readiness still uses live bindings.\n",errno);}
+    /* NX300 1.45: report the final stage unconditionally. The upstream code
+     * only printed it for rc==3, so any other exit code produced no evidence
+     * of where the transaction stopped. */
+    fprintf(stderr,"EXIT rc=%d stage=%s errno=%d\n",rc,stage,errno);
     if(rc==3)fprintf(stderr,"Admission/syscall/patch failed at %s (errno=%d); no successful installation claimed.\n",stage,errno);
     return rc;
 }
@@ -423,8 +428,20 @@ static int supervised_mutate(unsigned pid,const char *command,const char *blob,c
     char path[128];
     if(!state_path(pid,path,sizeof path)){
         fprintf(stderr,"No tmpfs/ramfs state directory for the transaction; nothing changed.\n");return 3;}
-    snprintf(path,sizeof path,"/var/run/nx300m-lut-worker-%u.log",(unsigned)getpid());
-    int log=open(path,O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC,0600);
+    /* NX300 1.45: keep the worker log on the SD card instead of tmpfs. The
+     * camera has been power-cycled after several apply attempts, and a tmpfs
+     * log dies with the reboot, leaving no evidence of where injection failed.
+     * /mnt/mmc survives. Fall back to tmpfs when the card is not writable. */
+    /* O_SYNC: FAT32 keeps write() bytes in the page cache, so a camera power
+     * cycle erased every worker log before it could be read. These logs are
+     * small and only written on abnormal paths, so synchronous writes are
+     * affordable and are the only way to observe a failing injection. */
+    snprintf(path,sizeof path,"/mnt/mmc/nx300m-lut-worker-%u.log",(unsigned)getpid());
+    int log=open(path,O_RDWR|O_CREAT|O_TRUNC|O_SYNC|O_CLOEXEC,0600);
+    if(log<0){
+        snprintf(path,sizeof path,"/var/run/nx300m-lut-worker-%u.log",(unsigned)getpid());
+        log=open(path,O_RDWR|O_CREAT|O_TRUNC|O_SYNC|O_CLOEXEC,0600);
+    }
     if(log<0&&errno==EEXIST){
         /* The file name carries this process's own pid, so an existing file
          * can only be a leftover from an earlier process whose pid the camera
@@ -441,7 +458,13 @@ static int supervised_mutate(unsigned pid,const char *command,const char *blob,c
         signal(SIGUSR1,request_abort);signal(SIGTERM,request_abort);signal(SIGINT,request_abort);signal(SIGPIPE,SIG_IGN);
         exit(mutate(pid,command,blob,root,fixture));
     }
-    unsigned long long deadline=now_ms()+15000;int status=0,finished=0;
+    /* NX300 1.45: the camera runs 71 threads on a single 800 MHz core, so
+     * attaching every TID plus the injection round-trips does not fit in the
+     * upstream 15 s budget. When that budget expired the supervisor killed the
+     * tracer while target TIDs were still ptrace-stopped, which froze the
+     * camera UI and forced a power cycle. 120 s is sized for the observed
+     * 71-thread target with headroom. */
+    unsigned long long deadline=now_ms()+120000;int status=0,finished=0;
     while(now_ms()<deadline){pid_t n=waitpid(child,&status,WNOHANG);if(n==child){finished=1;break;}
         if(n<0&&errno!=EINTR)break;
         struct timespec pause={0,10000000};nanosleep(&pause,NULL);}
