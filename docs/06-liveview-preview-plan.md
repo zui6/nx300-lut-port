@@ -158,3 +158,90 @@ rizin -N -q -e scr.color=0 -c "s sym.imp.ipcs_3d_lut; pd 4" libcapture-fw-slpcam
 
 **规则：任何槽位地址都必须从当次 `status` 现取 `iq_bias` / `udd_bias`，
 不要用记忆里的值。**
+
+---
+
+# 附：SmartFilter 桥接移植规格（NX300 1.45）
+
+> 2026-11-27 晚补。上游实现全部来自 `repo/nx300m-mod/`（`tools/build_smartfilter_preview.py`
+> 是权威规格，`runtime/smartfilter_lut_bridge.c` / `smartfilter_ipcs.c` 是实现）。
+
+## 一、上游到底怎么做的
+
+**实时预览的像素运算不是软件算的**，是让原厂 IPCS 硬件做 YCC→YCC 的 3D LUT：
+
+```
+nx_sf_preview(node,image,data,mode)   钩 smartFilter，
+    按线程建上下文、抢"帧门"，然后调原厂函数
+        ↓ 原厂函数内部会"应用效果"，那一步也被钩
+nx_sf_effect(effect,image)
+    mode != slot_mode → 走原厂
+    否则：
+      begin   按升序 trywait 4 个 B2Y 信号量；备份 6 个 ADE 开关
+      render  取几何(宽/高/stride/采样必须 YCC420)、取 Y/UV 输入输出平面地址
+              ipcs_open() → ADE_Ipcs_param_init()
+              只打开 ADE_IP_switch_RGB3D_LUT，其余关闭
+              ipcs_3d_lut(c, table+c*730) × 3 通道
+              FlushDCache(输入 Y/UV)
+              ADE_Ipcs_Ycc_correct_Param_SET(image)     ← 真正的 IPCS 运算
+              FlushDCache(输出 Y/UV)
+      restore ipcs_init() → IQ_IPC_Initialize(0) → IQ_IPC_Process(0)
+              还原 6 个 ADE 开关 → ipcs_close()
+      end     逆序 sem_post ×4
+```
+
+- 表格式：3 通道 × 729 节点（9³）+ 每通道 1 个零 padding，`u16`，取值 0..1023
+- 强度混合：`(identity*(100-s) + value*s + 50)/100`
+- **不需要在机身选滤镜**：它抢在"应用效果"之前，只看 `mode == slot_mode`（0 = 普通取景）
+- JPEG 复用已有的 `ipcs_3d_lut` 替换；`restore` 里的 `IQ_IPC_Process(0)` 就是把新色彩推给 JPEG
+- RAW 不碰：只处理 YCC 平面
+- 拍照让路：`capture_pending` 标志让下一帧立刻回退原厂
+
+## 二、NX300 上的 7 个钩子（已全部定位，GOT 槽）
+
+| # | 符号 | 类型 | NX300 GOT 槽 |
+|---|---|---|---|
+| 1 | `_ZN24CLiveviewNodeSmartFilter11smartFilterEP9CCapImagePv22E_LIVEVIEW_SMARTFILTER` | 导出@0x1d928c | `0x490330` |
+| 2 | `_Z26ADE_SmartFilter_YccProcess9eADE_MODEP9ADE_Image` | 导入 | `0x48ed44` |
+| 3 | `_ZN18CDDWrapperIPCS_B2Y16PrepareOperationEPFvvE` | 导出@0x15cfd0 | `0x49104c` |
+| 4 | `_ZN18CDDWrapperIPCS_B2Y15FinishOperationEv` | 导出@0x15d3c0 | `0x48e824` |
+| 5 | `_ZNK17CProcessParameter13GetEffectModeEv` | 导出@0x2ca864 | `0x494488` |
+| 6 | `_ZN15CLiveviewCommon18GetSmartFilterModeEv` | 导出@0x1f2e30 | `0x49037c` |
+| 7 | `_ZN24CLiveviewNodeSmartFilter14getWorkAddressE15E_LIVEVIEW_MODE` | 导出@0x1da1f8 | `0x4936c8` |
+
+**第 6、7 槽与上游 `S2_SLOTS = {5: 0x49037c, 6: 0x4936c8}` 完全一致**，说明两个固件的
+libcapture 在这些位置布局对齐，其余 5 个槽很可能也一致（用同一套偏移即可）。
+
+## 三、后端绑定（全部可按名字解析，无需逆向布局）
+
+| 用途 | 符号 | 所属 |
+|---|---|---|
+| B2Y 单例 | `_ZN18CDDWrapperIPCS_B2Y11GetInstanceEv` | libcapture |
+| LiveviewCommon 单例 | `_ZN15CLiveviewCommon11GetInstanceEv` | libcapture |
+| 取信号量 | `_ZN18CDDWrapperIPCS_B2Y12GetSemaphoreE18eIPCS_SEMAPHORE_ID` | libcapture |
+| 信号量 | `sem_trywait` / `sem_post` | libpthread |
+| IPCS 开关 | `ipcs_open` / `ipcs_close` / `ipcs_init` | libudd |
+| **写表** | **`ipcs_3d_lut`** | libudd（我们已有） |
+| ADE 初始化 | `_Z19ADE_Ipcs_param_initv` | libdi-alg-ipplatform |
+| **YCC 运算** | **`_Z30ADE_Ipcs_Ycc_correct_Param_SETP9ADE_Image`** | libdi-alg-ipplatform |
+| IQ 复位/重载 | `_Z17IQ_IPC_Initializei` / `_Z14IQ_IPC_Processi` | libiq（0x3265e8 / 0x32656c） |
+| 几何 | `ADE_Image::GetWidth/GetHeight/GetStride/GetSamType` | libdi-alg-ipplatform |
+| 平面地址 | `ADE_Image::GetAddress(eADE_ADDRESS_TYPE)` | 同上 |
+| 缓存 | `ADE_Image::FlushDCache(unsigned,unsigned)` | 同上 |
+| 6 个开关 | `ADE_IP_switch_pcse_GSHC` / `_pcse_PSHC` / `_pcse_SE` / **`_RGB3D_LUT`** / `_YCNR` / `_YLUT` | 同上（数据符号） |
+
+## 四、施工顺序建议
+
+1. **先只钩 `ADE_SmartFilter_YccProcess`（槽 2）+ 写探针**，确认普通取景下逐帧被调用
+   （这一条就能验证"不需要选滤镜"是否成立）
+2. 再钩 `smartFilter`（槽 1）建立帧上下文
+3. 接入 `begin/render/restore/end` 后端，先做 **passthrough**（只拷贝 Y/UV + flush），
+   画面应与原厂一致；这一步验证 cache 语义正确
+4. 最后打开 RGB3D_LUT 开关 + 写表，出真实效果
+5. 拍照让路（`PrepareOperation`/`FinishOperation` 两个槽就是干这个的）
+
+## 五、风险
+
+- 逐帧 IPCS 事务的时序（信号量、cache flush）必须和原厂一致，错了会花屏或卡顿
+- `ADE_IP_switch_*` 是数据符号，要按地址读写，不要当函数
+- 必须保留"失败就回退原厂效果"的语义，否则一帧出错整条管线就黑屏
