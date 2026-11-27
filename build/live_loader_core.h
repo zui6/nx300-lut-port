@@ -104,6 +104,21 @@ static const char *ms_text(char *buf,unsigned size,unsigned long long ms) {
     snprintf(buf,size,"%u.%03us",(unsigned)(ms/1000ULL),(unsigned)(ms%1000ULL));
     return buf;
 }
+/* NX300 1.45: %llu cannot be used across this GCC-14/libc-2.13 variadic
+ * boundary. A mis-consumed long long shifts every later argument, so a
+ * following %s receives a wild pointer and a following %c/%d prints garbage
+ * (observed: "state":" ", "tracer_pid":83, and a worker segfault inside
+ * snprintf before it could publish any marker). Convert 64-bit values to text
+ * first and pass only %s. */
+static const char *u64_text(char *buf,unsigned size,unsigned long long v) {
+    char tmp[24];unsigned n=0;
+    if(!v)tmp[n++]='0';
+    while(v){tmp[n++]=(char)('0'+(unsigned)(v%10ULL));v/=10ULL;}
+    if(n>=size)n=size-1;
+    for(unsigned i=0;i<n;i++)buf[i]=tmp[n-1-i];
+    buf[n]=0;
+    return buf;
+}
 static int liveview_comm_count(unsigned pid,const char *wanted,unsigned *count) {
     char path[64],line[128];snprintf(path,sizeof path,"/proc/%u/task",pid);
     DIR *directory=opendir(path);if(!directory)return 0;
@@ -235,9 +250,21 @@ static int detach_all(void) {
     int ok=1;
     for(unsigned i=0;i<nstops;i++)if(stops[i].attached){
         if(!stops[i].stopped){ok=0;continue;}
-        int sig=stops[i].signal;
-        if(stops[i].event==PTRACE_EVENT_STOP||sig==(SIGTRAP|0x80))sig=0;
-        if(ptrace(PTRACE_DETACH,stops[i].tid,NULL,(void*)(long)sig)<0)ok=0;
+        /* NX300 1.45: never re-inject a pending signal on detach.
+         *
+         * The upstream code forwards stops[i].signal so a real debugger keeps
+         * signal semantics. On this camera the application drives POSIX
+         * timers, and a thread can be observed stopped with real-time signal
+         * 42 (SIGRTMIN+10). PTRACE_DETACH then *delivers* that signal, and the
+         * default disposition of a real-time signal is to terminate the
+         * process. That killed di-camera-app right after every successful
+         * injection, which is exactly the observed behaviour: all stages
+         * complete, detach_all() returns success, then the camera reboots and
+         * no final EXIT line is ever written.
+         *
+         * We are not a debugger preserving signal state; a dropped timer signal
+         * simply fires again. Always detach with signal 0. */
+        if(ptrace(PTRACE_DETACH,stops[i].tid,NULL,(void*)0)<0)ok=0;
         else stops[i].attached=0;
     }
     return ok;

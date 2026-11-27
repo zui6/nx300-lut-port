@@ -163,7 +163,8 @@ static int marker(unsigned index,const char *text,unsigned pid) {
     unlink(tmp);return 0;
 }
 static int publish_markers(unsigned pid,const struct live_state *s,const char *root) {
-    char text[512];snprintf(text,sizeof text,"%u %llu %s %u %u\n",pid,s->start,root,s->region,s->length);
+    char text[512],stamp[24];
+    snprintf(text,sizeof text,"%u %s %s %u %u\n",pid,u64_text(stamp,sizeof stamp,s->start),root,s->region,s->length);
     if(!marker(0,text,pid))return 0;
     snprintf(text,sizeof text,"%u %s 1\n",pid,root);if(!marker(2,text,pid))return 0;
     snprintf(text,sizeof text,"%u %s\n",pid,root);return marker(1,text,pid);
@@ -507,7 +508,9 @@ static int inspect(unsigned pid) {
                slot_update==s.update&&slot_lut==s.ipcs&&cfg.root[163]==0){
                 ram_hooks=1;FILE *f=fopen("/var/run/nx300m-lut-ram-hook","r");
                 if(f){unsigned owner=0,region=0,size=0;unsigned long long stamp=0;char root[164];
-                    int count=fscanf(f,"%u %llu %163s %u %u",&owner,&stamp,root,&region,&size);fclose(f);
+                    char stampbuf[24]={0};
+                    int count=fscanf(f,"%u %23s %163s %u %u",&owner,stampbuf,root,&region,&size);fclose(f);
+                    stamp=(unsigned long long)strtoull(stampbuf,NULL,10);
                     ready=count==5&&owner==pid&&stamp==start&&region==s.region&&size==s.length&&!strcmp(root,cfg.root)&&cfg.enabled==1;}
             }
         }
@@ -519,7 +522,7 @@ static int inspect(unsigned pid) {
     for(unsigned i=0;identity&&i<nb;i++)if(before[i].tid!=after[i].tid||before[i].start!=after[i].start||before[i].tracer||after[i].tracer)identity=0;
     printf("{\"command\":\"status\",\"pid\":%u,\"executable\":",pid);quoted(exe);
     printf(",\"camera_name\":%s,\"thread_identity_stable\":%s,\"threads\":[",camera?"true":"false",identity?"true":"false");
-    for(unsigned i=0;i<nb;i++){if(i)putchar(',');printf("{\"tid\":%u,\"starttime\":%llu,\"state\":\"%c\",\"tracer_pid\":%d}",before[i].tid,before[i].start,before[i].state,before[i].tracer);}putchar(']');
+    for(unsigned i=0;i<nb;i++){if(i)putchar(',');{char sb[24];printf("{\"tid\":%u,\"starttime\":%s,\"state\":\"%c\",\"tracer_pid\":%d}",before[i].tid,u64_text(sb,sizeof sb,before[i].start),before[i].state,before[i].tracer);}}putchar(']');
     printf(",\"maps_read\":%s,\"old_module_conflict\":%s,\"stock_iq_sha256\":%s,\"stock_udd_sha256\":%s,\"dynamic_abi\":%s,\"memory_errno\":%d,\"code_bytes\":%s,\"rw_slots_original\":%s,\"ram_hooks_installed\":%s,\"iq_bias\":%u,\"udd_bias\":%u,\"slot_update\":%u,\"slot_lut\":%u,\"apply_enabled\":true,\"restore_enabled\":true,\"ready\":%s,\"target_writes\":0,\"image_verified\":false}\n",
         map_ok?"true":"false",conflict?"true":"false",iq_ok?"true":"false",udd_ok?"true":"false",abi?"true":"false",mem_errno,code?"true":"false",slots?"true":"false",ram_hooks?"true":"false",iq.bias,udd.bias,slot_update,slot_lut,ready?"true":"false");
     /* Exit 0 means the read-only admission checks passed, never installation. */

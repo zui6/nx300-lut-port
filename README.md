@@ -27,7 +27,7 @@
 
 ---
 
-## 现状（2026-11-22）
+## 现状（2026-11-27）：**照片已可用**
 
 | 环节 | 状态 |
 |---|---|
@@ -36,30 +36,41 @@
 | RAM blob admission | ✅ 通过 |
 | ptrace attach（71 线程） | ✅ 通过 |
 | 远程 `mmap2` / 写入 10 万字节 / `cacheflush` / `mprotect` | ✅ 通过 |
-| 写 GOT / vtable | ✅ 通过 |
+| 写 GOT / vtable（内存实测一致） | ✅ 通过 |
 | `detach_all()` 恢复全部线程 | ✅ 通过 |
-| **hook 被相机调用时的行为** | ⚠️ **未验证**（见下） |
-| LUT 实际生效 | ❌ 未验证 |
+| **hook 被相机调用** | ✅ 实测（trace `update_tid=286`、`write_calls=3`） |
+| **LUT 表替换生效** | ✅ 实测（`forwarded_ptrs` 指向 blob 内的表） |
+| **拍照出片带 LUT** | ✅ **实机拍摄验证为黑白** |
+| 取景 / 快速预览带 LUT | ❌ 未实现（需另一库的桥接，见下） |
 
 实测 `apply` 完整日志：
 
 ```
-Still control admission: full_hash elapsed_ms=2.231s cache_hits=0 hashed_files=4; camera running
+Still control admission: cached_file_identity elapsed_ms=0.891s cache_hits=2 hashed_files=2; camera running
 STAGE mmap2
 STAGE private-map-copy
 STAGE cacheflush
 STAGE mprotect
 STAGE state-and-slot-commit
 STAGE slot-commit
-Still target stop window: 0.339s; file verification ran before attach.
+Still target stop window: 0.314s; file verification ran before attach.
+EXIT rc=0 stage=slot-commit errno=0
+{"command":"apply","pid":265,"hooks_installed":true,"region":...,"ready":true}
 ```
 
-**整个 attach + 注入 + detach 只用了 339 毫秒**，所有阶段执行完毕。
+完整可用配方、验证方法、排错表见 **[docs/05-photo-lut-working.md](docs/05-photo-lut-working.md)**。
 
-唯一未确认的是「hook 被调用时会不会崩」：`CIpcParameterNode::Update`
-只在相机**操作面板 / 切换 LUT 参数**时才触发，自动化测试期间没人碰相机，
-因此 blob 里埋的探针（`/mnt/mmc/lut-hook-entered`）没有出现——
-这是**预期行为，不能据此判定安装失败**。
+### 为什么取景预览还是彩色
+
+这是**架构差异**，不是 bug：
+
+| 路径 | 库 | 本方案覆盖 |
+|---|---|---|
+| 拍照 JPEG | `libiq-fw-slpcam.so` → `ipcs_3d_lut` | ✅ |
+| 取景 / 快速预览 | `libcapture-fw-slpcam.so` → SmartFilter YCC 链 | ❌ |
+
+原厂取景是一条独立的 SmartFilter 节点 + YCC→IPCS→YCC 处理链，需要在另一个
+4.7 MB 的库上再做一套桥接。实测把相机智能滤镜切到「微型」也不能让预览显示本 LUT。
 
 **相机没有变砖**：所有改动只落在 SD 卡、`/tmp`（tmpfs）和运行时内存，
 崩溃后重启即恢复；拔掉 SD 卡完全回到原厂状态。
@@ -130,7 +141,8 @@ docs/
   01-feasibility.md              # 机理分析：rc=75 真因、指纹锁全景
   02-binary-patch.md             # 二进制补丁路线（16 处 / 227 字节）
   03-source-port.md              # 源码级移植
-  04-injection.md                # ptrace 注入打通与当前卡点
+  04-injection.md                # ptrace 注入打通
+  05-photo-lut-working.md        # ★ 稳定版完整配方、验证证据、排错表
 tools/
   gen_stock.py                   # 从 ELF 生成 lut_live_stock.h
   make_binary_patch.py           # 生成二进制补丁版 loader
