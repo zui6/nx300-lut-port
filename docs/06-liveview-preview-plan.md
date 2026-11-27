@@ -304,3 +304,49 @@ libcapture 在这些位置布局对齐，其余 5 个槽很可能也一致（用
 - loader 已能认证 ipplat 并解析出 22/24（缺的正是 `sem_post` 与另一处）
 - `STOCK_CAP_SF_SLOT` 曾误算为 4788528（=`0x491330`），正确值是 **4784944**（`0x490330`）；
   错误版本会把钩子打到无关 GOT 槽，已修复并记录
+
+---
+
+# 附三：IPCS 事务已在 NX300 实机跑通（2026-11-27 23:2x）
+
+## 实测结果
+
+装的是 `loader 88eca983` / `blob ba97bc5c`（tag 1071677719），普通取景下连续 70 帧，
+每一步返回 0，**相机画面完全正常**：
+
+| 诊断项 | 值 | 含义 |
+|---|---|---|
+| `step` | 5 | 事务走到"无表设计终点"（flush 完成，未写表/未跑 YCC） |
+| `begin_rc` | 0 | **4 个 B2Y 信号量全部 trywait 成功** |
+| `render_rc` | 0 | ipcs_open + ADE_Ipcs_param_init + 输入 flush 全成功 |
+| `restore_rc` | 0 | ipcs_init + IQ_IPC_Initialize(0) + IQ_IPC_Process(0) + 恢复开关 + close 全成功 |
+| `w/h/stride/sam` | 720/480/800/0 | 采样 = YCC420，正是 3D LUT 运算要求的布局 |
+| `y_in/uv_in/y_out/uv_out` | 非空 | 四个平面地址全部有效 |
+| `bytes/chroma` | 384000/192000 | 800×480 与一半色度 |
+| `frames` | 70 | 接管帧数 |
+
+**结论：原厂 IPCS 通道可以在 NX300 上被安全借用**，信号量协议、几何读取、
+缓存 flush、状态恢复全部正确。
+
+## 期间修掉的 5 个真实缺陷
+
+1. **后端数组错位 2 个字** — `ipp_names` 的 14 项被 IQ 覆盖了两项，
+   导致 `GetWidth/GetHeight` 被挤掉、后续整体左移 → 桥接验证失败拒绝装配
+2. **`slot_mode` 配成 0** — 实测普通取景传的是 **mode = 1**，所以从未接管
+3. **`fallback()` 用 passthrough 顶替原厂** — 这是"取景冻结但相机完全可用"的元凶：
+   拷贝"成功"就直接返回 OK，原厂再也不画这一帧
+4. **数组停在 `extra+8` 而 wrapper 传 `extra`** — 错位 2 字，装配必失败
+5. **装配失败时钩子吞掉调用** — 已改为自己转发原厂，绝不吞
+
+## 关键教训
+
+- **`contexts_offset` 不是常量**：桥接加入 `.bss` 后它从 16580 变 24772、又变 23676，
+  `extra` 必须每次从 blob 头读取，不能缓存
+- **`slot_mode` 必须实测**，不能照搬上游的 0
+- **任何"接管"路径都必须能回退到原厂**，否则一旦失败画面就停
+
+## 下一步
+
+给表：把 3×730 的 `u16` 表传给 `nx_sf_init`，让 `have_table=1`，
+`render` 就会执行 `write_lut` + `ADE_Ipcs_Ycc_correct_Param_SET` + 输出 flush，
+然后把诊断路由改为"自己产出画面、不调原厂"。
