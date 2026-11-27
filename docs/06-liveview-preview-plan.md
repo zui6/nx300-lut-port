@@ -416,3 +416,62 @@ bytes/chroma = 384000/192000
 3. 接 `PrepareOperation`/`FinishOperation` 做拍照让路
 4. 支持运行中切换 LUT（现在装配时读一次）
 5. 接开机自动安装
+
+---
+
+# 附四：取景实时 LUT 成功（2026-11-27 23:4x）
+
+## 结果
+
+**NX300 1.45 上，普通取景模式（P/A/S/M，不选任何滤镜）实时预览已经带上 LUT，实机确认。**
+
+| 版本 | loader | blob | 状态 |
+|---|---|---|---|
+| 首个可用 | `85298c33` | `2312cb50` | 出效果，2.5 FPS |
+| 首轮优化 | `29ee1520` | `05c800e9` | IQ 同步改为一次（待测） |
+
+## 性能与已定位开销
+
+首个可用版本 **2.5 FPS**（每帧约 400 ms）。主因是 `restore()` 每帧都跑
+`IQ_IPC_Initialize(0)` + `IQ_IPC_Process(0)`——重跑整条 IQ 参数初始化，
+原厂只在设置变化时调。已改为只做一次，失败时重新置位；`ipcs_init` 仍每帧
+（它才真正锁存 ADE 开关）。
+
+## 与上游的差异（澄清：逻辑是照搬，不是新设计）
+
+| 项 | 上游 | 本移植 |
+|---|---|---|
+| 钩子数 | 7 个（含拍照让路） | **2 个**（smartFilter + ADE_SmartFilter_YccProcess） |
+| 表来源 | 引擎在线下发 | 装配时读一次 |
+| 拍照让路 | 有 | 还没有 |
+
+## 事务实测（全部 rc=0）
+
+```
+step=7  ipcs_open=0  输入flush=0  YCC=0  begin=0  render=0  restore=0
+720x480 stride 800 sam=0(YCC420)   planes 全部非空   bytes/chroma=384000/192000
+```
+
+## 修掉的 6 个缺陷
+
+1. 后端数组错位 2 字（IQ 覆盖两个 ADE_Image getter）
+2. `slot_mode` 配 0（实测应为 **1**）
+3. `fallback()` 用 passthrough 顶替原厂 → 取景冻结但相机可用
+4. 数组停 `extra+8` 而 wrapper 传 `extra`
+5. 装配失败时钩子吞掉调用
+6. `IQ_IPC_Initialize/Process` 每帧调用 → 2.5 FPS
+
+## 三个必须记住的坑
+
+- **`extra` 偏移不是常量**：随 `.bss` 变化从 89540→97732→93636→106852，
+  每次必须用 `reserved[0] + reserved[2]*reserved[1]` 现算
+- **`slot_mode` 必须实测**
+- **任何接管路径都必须能回退原厂**
+
+## 待办
+
+1. 测优化后帧率（目标 ≥15 FPS）
+2. 仍卡则把 `ipcs_open/close` 常驻、写表只在表变化时做
+3. 接拍照让路
+4. 运行中切换 LUT
+5. 开机自动安装
