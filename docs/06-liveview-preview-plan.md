@@ -245,3 +245,62 @@ libcapture 在这些位置布局对齐，其余 5 个槽很可能也一致（用
 - 逐帧 IPCS 事务的时序（信号量、cache flush）必须和原厂一致，错了会花屏或卡顿
 - `ADE_IP_switch_*` 是数据符号，要按地址读写，不要当函数
 - 必须保留"失败就回退原厂效果"的语义，否则一帧出错整条管线就黑屏
+
+---
+
+# 附二：桥接代码已交付 + 集成清单（2026-11-27 晚）
+
+## 实测结论（本步已完成）
+
+**`CLiveviewNodeSmartFilter::smartFilter` 在普通取景下持续被调用：3 秒 377 次，不需要开任何滤镜。**
+
+- 钩子写的是 `libcapture + 0x490330`，指向 blob 的 `region+6812`
+- 转发回原厂（`cap.bias+0x1d928c`）后相机行为完全正常
+- 探针位于 `&contexts[SLOTS]`：`[0]`=原始地址、`[1]`=调用计数
+
+## 桥接代码
+
+| 文件 | 大小 | 内容 |
+|---|---|---|
+| `experimental/lut_live_bridge.c` | 16,050 B（366 行） | preview/effect 状态机 + begin/render/restore/end + passthrough + cache 合并 + 几何门限；任何错误先 restore 再回退原厂 |
+| `experimental/lut_live_bridge.NOTES.md` | 2,624 B | 与上游的逐项差异与假设 |
+
+三个导出（全 `hidden`、无 libc、无全局重定位）：
+`nx_lut_ram_smartfilter` / `nx_lut_ram_effect` / `nx_lut_ram_bridge_init`
+
+## 集成时必须处理的 5 件事
+
+1. **后端数组是 28 字**
+   `0=thread_id, 1=sem_trywait, 2=sem_post, 3=GetSemaphore, 4=GetInstance,
+   5=ipcs_open, 6=ipcs_close, 7=ipcs_init, 8=ipcs_3d_lut,
+   9=ADE_Ipcs_param_init, 10=ADE_Ipcs_Ycc_correct_Param_SET,
+   11=IQ_IPC_Initialize, 12=IQ_IPC_Process,
+   13..18=ADE_Image::{GetWidth,GetHeight,GetStride,GetSamType,GetAddress,FlushDCache},
+   19..24=六个 ADE switch, 25=slot_mode（值，非地址）,
+   26=原始 smartFilter, 27=原始 YccProcess`
+   **26/27 是转发目标；缺任一，init 拒绝安装（fail closed）**
+
+2. **`sem_post` 不在 libc**
+   glibc 2.13 把它放在 `/lib/libpthread-2.13.so`
+   （123,261 字节，sha256 `9efdcac03e36b6d770ece6c71af358cb30ef49cb448ed7d016de19ff5f5d475f`）
+   → 需要认证第 7 个库：`libpthread-2.13.so`
+
+3. **名字冲突**：`lut_ram_blob.c` 里现有的探针版 `nx_lut_ram_smartfilter` 必须删掉，
+   改用桥接版；两者不能同时链接。
+
+4. **init 不能被 loader 直接调用**（loader 只有 SVC 远程调用，不能调任意函数）。
+   建议：后端数组停在 `&contexts[SLOTS]`（现有约定），
+   在 `lut_ram_blob.c` 加一个 `nx_lut_ram_backend()` 返回该指针，桥接 `extern` 它，
+   首次进入时自己取 → 完全省掉 `nx_lut_ram_bridge_init` 调用。
+
+5. **新入口槽**：`.ld` 的 word 15（`reserved[5]`）现为 `LONG(0)`，放 `nx_lut_ram_effect`；
+   loader 再钩 `cap+0x48ed44`（`ADE_SmartFilter_YccProcess`）指向它。
+
+## 已核对的前提
+
+- ipplat 14 个符号全部存在（`bin/camlibs/libdi-alg-ipplatform.so` 已拉取到本地，59,452 B，
+  sha256 `f89efb4df089e392d2a3f121ac8cf29f597b6e5d78d0ea1822e93635de6908a7`）
+- libcapture / libudd / libiq 的其余符号全部命中
+- loader 已能认证 ipplat 并解析出 22/24（缺的正是 `sem_post` 与另一处）
+- `STOCK_CAP_SF_SLOT` 曾误算为 4788528（=`0x491330`），正确值是 **4784944**（`0x490330`）；
+  错误版本会把钩子打到无关 GOT 槽，已修复并记录
