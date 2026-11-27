@@ -350,3 +350,69 @@ libcapture 在这些位置布局对齐，其余 5 个槽很可能也一致（用
 给表：把 3×730 的 `u16` 表传给 `nx_sf_init`，让 `have_table=1`，
 `render` 就会执行 `write_lut` + `ADE_Ipcs_Ycc_correct_Param_SET` + 输出 flush，
 然后把诊断路由改为"自己产出画面、不调原厂"。
+
+---
+
+# 附四：取景实时 LUT 成功（2026-11-27 23:4x）
+
+## 结果
+
+**NX300 1.45 上，普通取景模式（P/A/S/M，不选任何滤镜）实时预览已经带上 LUT，实机确认。**
+
+| 版本 | loader | blob | 状态 |
+|---|---|---|---|
+| 首个可用 | `85298c33` | `2312cb50` | ✅ 出效果 |
+| 首轮优化 | `29ee1520` | `05c800e9` | IQ 同步改为一次（待测帧率） |
+
+## 性能
+
+- 首个可用版本：**2.5 FPS**（每帧约 400 ms），明显卡顿
+- 已定位主要开销：`restore()` 里每帧都跑 `IQ_IPC_Initialize(0)` + `IQ_IPC_Process(0)`，
+  这两个是重跑整条 IQ 参数初始化，原厂只在设置变化时调
+- 已改为：`ipcs_init` 仍每帧（它才真正锁存 ADE 开关），IQ 同步只做一次，
+  失败时重新置位
+
+## 与上游的真实差异（澄清）
+
+逻辑**逐条照搬**上游 `smartfilter_lut_bridge.c` + `smartfilter_ipcs.c`，不是新设计。差异只有三处：
+
+| 项 | 上游 | 本移植 |
+|---|---|---|
+| 钩子数 | 7 个（含拍照让路 `PrepareOperation`/`FinishOperation`） | **2 个**（`smartFilter` + `ADE_SmartFilter_YccProcess`） |
+| 表来源 | 引擎在线下发、可随时切换 | 装配时读一次，之后固定 |
+| 拍照让路 | 有 | **还没有** |
+
+## 事务实测数据（全部 rc=0）
+
+```
+step=7   ipcs_open=0   输入flush=0   YCC=0   begin=0   render=0   restore=0
+w/h/stride/sam = 720/480/800/0   (YCC420)
+y_in/uv_in/y_out/uv_out 全部非空
+bytes/chroma = 384000/192000
+```
+
+## 一路修掉的 6 个缺陷
+
+1. **后端数组错位 2 字** — IQ 的 2 项覆盖了 `ADE_Image` 的两个 getter，
+   后续整体左移 → 桥接验证失败拒绝装配
+2. **`slot_mode` 配成 0** — 实测普通取景传 **mode = 1**
+3. **`fallback()` 用 passthrough 顶替原厂** — 「取景冻结但相机完全可用」的元凶
+4. **数组停 `extra+8` 而 wrapper 传 `extra`** — 错位 2 字
+5. **装配失败时钩子吞掉调用** — 已改为自己转发原厂
+6. **`IQ_IPC_Initialize/Process` 每帧调用** — 2.5 FPS 的主因
+
+## 最关键的三个坑（写进经验）
+
+- **`contexts_offset` / `stride` / `count` 不是常量**：桥接加入 `.bss` 后
+  `extra` 从 89540 → 97732 → 93636 → 106852 变过四次，
+  **必须每次从 blob 头 `reserved[0] + reserved[2]*reserved[1]` 现算**
+- **`slot_mode` 必须实测**
+- **任何接管路径都必须能回退原厂**，否则画面停住而进程毫无异常
+
+## 待办
+
+1. 测优化后帧率（目标 ≥15 FPS）
+2. 若仍卡：把 `ipcs_open/close` 也改为常驻，并只在表变化时写 3×730 字
+3. 接 `PrepareOperation`/`FinishOperation` 做拍照让路
+4. 支持运行中切换 LUT（现在装配时读一次）
+5. 接开机自动安装

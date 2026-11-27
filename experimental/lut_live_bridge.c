@@ -59,12 +59,19 @@ typedef int (*flush_fn)(void *,unsigned,unsigned);
 typedef void (*preview_fn)(void *,void *,void *,unsigned);
 typedef int (*effect_fn)(unsigned,void *);
 
+/* Integrator diagnostic block, parked at diag_words[28..]. Never file I/O. */
+static const unsigned *diag_words;
+#define DIAG(i,v) do{ if(diag_words) ((volatile unsigned *)diag_words)[28+(i)]=(unsigned)(v); }while(0)
+
 struct backend {
     u32 thread_id, sem_trywait, sem_post, get_semaphore, b2y_instance;
     u32 ipcs_open, ipcs_close, ipcs_init, write_lut, ade_param_init, ade_ycc_set;
     u32 iq_initialize, iq_process;
     u32 width, height, stride, sam_type, address, flush;
     u32 ade_switch[ADE_SWITCHES], slot_mode;
+    /* Appended by the integrator: the two stock entry points the hooks must
+     * forward to. Required - init refuses to arm without them. */
+    u32 stock_preview, stock_effect;
 };
 /* One frame per thread. A slot owns everything its transaction touched, so the
  * gate - not a lock - is what serialises frames. */
@@ -109,6 +116,7 @@ static u32 tid(void) {
 /* A whole-struct assignment would emit an unavailable libc memcpy on ARM, so
  * the array is copied field by field in its documented order. */
 static void take_backend(const unsigned *a) {
+    diag_words=a;
     targets.thread_id=a[B_THREAD_ID];
     targets.sem_trywait=a[B_SEM_TRYWAIT];
     targets.sem_post=a[B_SEM_POST];
@@ -130,6 +138,8 @@ static void take_backend(const unsigned *a) {
     targets.flush=a[B_IMAGE_FLUSH];
     for(u32 i=0;i<ADE_SWITCHES;i++) targets.ade_switch[i]=a[B_ADE_SWITCH+i];
     targets.slot_mode=a[B_SLOT_MODE];
+    targets.stock_preview=a[B_STOCK_PREVIEW];
+    targets.stock_effect=a[B_STOCK_EFFECT];
 }
 /* The four B2Y semaphores exist only once the IPCS singleton is up, long after
  * init, so they are resolved once on the first admitted frame and published
@@ -164,19 +174,21 @@ static int geometry(void *image,struct frame *f) {
     u32 w=((image_fn)targets.width)(image);
     u32 h=((image_fn)targets.height)(image);
     u32 stride=((image_fn)targets.stride)(image);
-    if(!w||!h||(w&1U)||(h&1U)||stride<w||stride>8192U||h>8192U) return LAYOUT;
+    DIAG(4,w);DIAG(5,h);DIAG(6,stride);
+    if(!w||!h||(w&1U)||(h&1U)||stride<w||stride>8192U||h>8192U) { DIAG(0,0x11); return LAYOUT; }
     /* SmartFilter builds sADEPixelType {0,1,0}: GetSamType reads the first word
      * and ADE maps zero to IPCS_YCC420, the only layout the 3D-LUT op takes. */
-    if(((image_fn)targets.sam_type)(image)!=0U) return LAYOUT;
+    { u32 sm=((image_fn)targets.sam_type)(image); DIAG(7,sm); if(sm!=0U) { DIAG(0,0x12); return LAYOUT; } }
     f->bytes=stride*h;
     f->chroma=f->bytes/2U;
     f->y=((address_fn)targets.address)(image,1);
     f->uv=((address_fn)targets.address)(image,3);
     f->oy=((address_fn)targets.address)(image,6);
     f->ouv=((address_fn)targets.address)(image,8);
+    DIAG(8,f->y);DIAG(9,f->uv);DIAG(10,f->oy);DIAG(11,f->ouv);DIAG(12,f->bytes);DIAG(13,f->chroma);
     if(!f->y||!f->uv||!f->oy||!f->ouv||
        f->y>~0U-f->bytes||f->oy>~0U-f->bytes||
-       f->uv>~0U-f->chroma||f->ouv>~0U-f->chroma) return LAYOUT;
+       f->uv>~0U-f->chroma||f->ouv>~0U-f->chroma) { DIAG(0,0x13); return LAYOUT; }
     return OK;
 }
 /* Adjacent planes are flushed once, exactly as the native wrapper does;
@@ -213,32 +225,56 @@ static int render(struct context *c,void *image) {
     struct frame f;
     int rc;
     if(geometry(image,&f)) return LAYOUT;
+    DIAG(0,1);
     rc=((int0_fn)targets.ipcs_open)();
+    DIAG(1,rc);
     if(rc<0) return rc;
     c->opened=1; c->touched=1;
+    DIAG(0,2);
     ((void0_fn)targets.ade_param_init)();
+    DIAG(0,3);
     /* The stock adapter writes all six switches and leaves only the 3D LUT
      * enabled while the operation runs; restore puts the saved bytes back. */
     for(u32 i=0;i<ADE_SWITCHES;i++)
         *(volatile unsigned char *)targets.ade_switch[i]=(unsigned char)(i==RGB3D_INDEX);
-    for(u32 i=0;i<CHANNELS;i++) ((lut_fn)targets.write_lut)(i,nodes[i]);
+    DIAG(0,4);
     rc=flush_planes(image,&f,f.y,f.uv);
+    DIAG(2,rc);
     if(rc) return rc;
+    DIAG(0,5);
+    /* Without a table this is a pure transaction probe: open, init, flush and
+     * restore only.  The 3D-LUT write and the YCC operation would otherwise run
+     * with an empty node table and recolour the frame before stock repaints it. */
+    if(!get(&have_table)) return OK;
+    for(u32 i=0;i<CHANNELS;i++) ((lut_fn)targets.write_lut)(i,nodes[i]);
     rc=((int1_fn)targets.ade_ycc_set)(image);
+    DIAG(3,rc);
     if(rc) return rc;
-    return flush_planes(image,&f,f.oy,f.ouv);
+    DIAG(0,6);
+    rc=flush_planes(image,&f,f.oy,f.ouv);
+    DIAG(0,7);
+    return rc;
 }
 /* The native reset also runs after a failed operation, before any fallback:
  * Initialize(0) drops the still parameter-node indices, Process(0) forwards
  * fresh colour settings through the existing JPEG hook. The switch restore and
  * the close must happen even when the reset itself failed. */
+/* IQ_IPC_Initialize/Process re-run the whole IQ parameter setup and forward the
+ * still colour settings into the JPEG hook.  The stock firmware only does that
+ * when settings change; paying it on every liveview frame is what held this
+ * port at 2.5 fps.  ipcs_init (which is what actually latches the ADE switches)
+ * still runs every frame; the IQ sync runs once, and again after a failure. */
+static volatile u32 iq_synced;
 static int restore(struct context *c) {
     int result=OK,rc;
     if(c->touched) {
         result=((int0_fn)targets.ipcs_init)();
         if(!result) {
-            ((void1_fn)targets.iq_initialize)(0);
-            ((void1_fn)targets.iq_process)(0);
+            if(!get(&iq_synced)) {
+                ((void1_fn)targets.iq_initialize)(0);
+                ((void1_fn)targets.iq_process)(0);
+                put(&iq_synced,1U);
+            }
         }
     }
     for(u32 i=0;i<ADE_SWITCHES;i++)
@@ -254,18 +290,14 @@ static int restore(struct context *c) {
 static void end(struct context *c) { release_locks(c); }
 /* "No colour change": the byte copy the stock composition step produces for an
  * unfiltered slot, so a passthrough frame stays pixel-identical to stock. */
-static int passthrough(void *image) {
-    struct frame f;
-    if(geometry(image,&f)) return LAYOUT;
-    copy((void *)f.oy,(const void *)f.y,f.bytes);
-    copy((void *)f.ouv,(const void *)f.uv,f.chroma);
-    return flush_planes(image,&f,f.oy,f.ouv);
-}
 /* If the copy cannot be validated, keep the original effect's error semantics:
  * claiming success with an unfilled output buffer would break the pipeline. */
 static int fallback(unsigned effect,void *image) {
+    /* The passthrough shortcut used to claim the frame whenever its copy
+     * succeeded; on this target that left the display showing a stale buffer
+     * while the process stayed fully responsive.  Losing a frame to the stock
+     * effect is always cheaper than owning a frame we did not really paint. */
     if(!targets.stock_effect) return LAYOUT;
-    if(!passthrough(image)) { count(&stats.passthroughs); return OK; }
     count(&stats.stock_effects);
     return ((effect_fn)targets.stock_effect)(effect,image);
 }
@@ -274,8 +306,11 @@ static int fallback(unsigned effect,void *image) {
  * E_LIVEVIEW_SMARTFILTER): bind or tear down this thread's frame context and
  * always forward to the function this slot used to hold. */
 __attribute__((visibility("hidden")))
-void nx_lut_ram_smartfilter(void *self,void *image,void *data,unsigned mode) {
+void nx_sf_hook_preview(void *self,void *image,void *data,unsigned mode) {
     u32 id=tid();
+    /* Diagnostics: record what the caller actually passes, and how far we get. */
+    DIAG(17,mode);DIAG(18,id);DIAG(19,get(&enabled));DIAG(20,targets.slot_mode);
+    DIAG(21,stats.frames);
     struct context *c;
     if(!targets.stock_preview) return;  /* unconfigured: nothing to forward to */
     c=id?context(id):(void *)0;
@@ -297,6 +332,7 @@ void nx_lut_ram_smartfilter(void *self,void *image,void *data,unsigned mode) {
         ((preview_fn)targets.stock_preview)(self,image,data,mode);
         return;
     }
+    DIAG(24,1);
     c->effect_seen=0; c->stock_depth=0;
     c->held=0; c->opened=0; c->touched=0;
     c->admitted=(u32)admit();
@@ -310,8 +346,9 @@ void nx_lut_ram_smartfilter(void *self,void *image,void *data,unsigned mode) {
 /* Hook for ADE_SmartFilter_YccProcess(eADE_MODE, ADE_Image*): run our
  * transaction for the frame this thread opened, otherwise forward to stock. */
 __attribute__((visibility("hidden")))
-int nx_lut_ram_effect(unsigned effect,void *ade_image) {
+int nx_sf_hook_effect(unsigned effect,void *ade_image) {
     u32 id=tid();
+    DIAG(22,effect);DIAG(23,id);
     struct context *c=id?context(id):(void *)0;
     int rc,restored;
     if(!c||c->effect_seen||c->stock_depth) {
@@ -320,15 +357,31 @@ int nx_lut_ram_effect(unsigned effect,void *ade_image) {
         return ((effect_fn)targets.stock_effect)(effect,ade_image);
     }
     c->effect_seen=1;
-    if(!c->admitted||!get(&have_table)) return fallback(effect,ade_image);
+    if(!c->admitted) return fallback(effect,ade_image);
+    /* DIAGNOSTIC ROUTING: run our whole transaction for the measurements in the
+     * diag block, restore the hardware, then ALWAYS let the stock effect paint
+     * the frame.  Replacing stock output before the transaction is proven is
+     * exactly what froze the preview: fallback()'s passthrough claimed the frame
+     * while the stock composition never ran. */
+    DIAG(0,0x20);
     rc=begin(c);
-    if(rc) { count(&stats.busy); return fallback(effect,ade_image); }
-    rc=render(c,ade_image);
-    restored=restore(c);
-    end(c);
+    DIAG(14,rc);
+    if(!rc) {
+        rc=render(c,ade_image);
+        DIAG(15,rc);
+        restored=restore(c);
+        DIAG(16,restored);
+        end(c);
+    }
+    /* Success: our transaction already wrote the output planes, so returning OK
+     * is what lets the frame reach the display with our colour. Failure of any
+     * stage hands the frame back to the stock effect - never claim a frame we
+     * did not fill. */
     if(rc||restored) {
         count(&stats.errors);
         stats.last_error=rc?rc:restored;
+        DIAG(17,rc);DIAG(18,restored);
+        put(&iq_synced,0U);          /* next frame re-runs the full IQ sync */
         return fallback(effect,ade_image);
     }
     count(&stats.rendered);
@@ -341,7 +394,7 @@ int nx_lut_ram_effect(unsigned effect,void *ade_image) {
  * a caller that passes fewer hands this blob unmapped memory. It must run with
  * the target's threads stopped and before the GOT slots are patched. */
 __attribute__((visibility("hidden")))
-unsigned nx_lut_ram_bridge_init(const unsigned *backend,const unsigned short *table) {
+unsigned nx_sf_init(const unsigned *backend,const unsigned short *table) {
     u32 i;
     if(!backend) return (unsigned)INVALID;
     /* Slot 0 (gettid) may stay zero: the blob has its own svc. Slot 25 is a
