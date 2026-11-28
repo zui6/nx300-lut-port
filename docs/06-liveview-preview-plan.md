@@ -696,3 +696,67 @@ UV 平面偏移 = offsetX + (offsetY / 2) * gWidth
 4. 有了这三个表就能在 DisplayAdjust 钩子里原样构造
 
 **安全底线不变**：任一字段异常 → 直接转发原厂，不跑事务。
+
+---
+
+# 附九：三个结构字段已还原（2026-11-28）
+
+## sADEImgSize = { width, height, stride }
+
+```asm
+0x1d93dc getWidth()   → [fp,-0x18]
+0x1d93ec getHeight()  → [fp,-0x20]
+0x1d93fc getGWidth()  → [fp,-0x24]        ← 步长
+0x1d940c getOffsetX() → [fp,-0x28]
+
+0x1d94bc/0x1d94c0  [fp,-0x18] → sADEImgSize[0]
+0x1d94c4/0x1d94c8  [fp,-0x20] → sADEImgSize[1]
+0x1d94cc/0x1d94d0  [fp,-0x24] → sADEImgSize[2]
+```
+
+**特殊分支**（必须同样实现，否则宽高错位）：
+
+```text
+if (CLiveviewCommon::GetAspectRatio() == 2 && CLiveviewCommon::GetStreamMode() == 0) {
+    [fp,-0x14] = ((gWidth - height) / 2) - offsetX ;   // 水平偏移
+    [fp,-0x18] = height ;                              // 覆盖第一字段
+}
+```
+对应 `0x1d9418..0x1d9490`。
+
+## sADEYccAddr（20 字节 / 5 字）的 4 个可写字段
+
+```text
+[+0x04] = [fp,-0x6c] + Y偏移  + [fp,-0x14]      ; Y 平面地址
+[+0x08] = [+0x04] + gWidth                       ; Y 行尾 = Y基址 + 步长
+[+0x0C] = [fp,-0x64] + UV偏移 + [fp,-0x14]      ; UV 平面地址
+[+0x10] = [+0x0C] + gWidth                       ; UV 行尾
+```
+
+- `[fp,-0x6c]` = `CCapBuffer::getVirtAddress()` 返回的基址
+- `[fp,-0x64]` = 第二个缓冲基址（另一 sADEYccAddr 的来源）
+- 偏移公式见附七
+- `[+0x00]` 未在此段写入（应为清零/类型，待确认）
+
+对应 `0x1d9628..0x1d9684`（#1）与 `0x1d9748..0x1d9790`（#2）。
+
+## sADEPixelType = { 0, 1, 0 }
+
+`0x1d99cc..0x1d99e0` 写入三个字：`0, 1, 0`。
+
+## 钩子实现要点
+
+```c
+int hook(self, CCapImage *img, void *data, unsigned cb) {
+    if (img && 几何符合预期 && 取址成功) {
+        构造 sADEImgSize / sADEYccAddr x2 / sADEPixelType;
+        构造 ADE_Image;
+        RegFlushFunc(...);
+        ADE_SmartFilter_YccProcess(mode, &ade);
+    }
+    return 原厂Execute(self, img, data, cb);   // 永远转发
+}
+```
+
+**未确认项**：`[+0x00]` 字段语义；`[fp,-0x64]` 的来源（应是第二个 buffer）。
+上机前应先只记录这两个值，与 `[fp,-0x6c]` 比对。
