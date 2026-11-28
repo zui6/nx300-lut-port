@@ -760,3 +760,63 @@ int hook(self, CCapImage *img, void *data, unsigned cb) {
 
 **未确认项**：`[+0x00]` 字段语义；`[fp,-0x64]` 的来源（应是第二个 buffer）。
 上机前应先只记录这两个值，与 `[fp,-0x6c]` 比对。
+
+---
+
+# 附十：调试方法论修正（2026-11-28）—— 之前几小时的「零输出」是假象
+
+## 真相：apply 的输出不在终端，而在 worker 日志
+
+`supervised_mutate` 会 fork 子进程，并在子进程里：
+
+```c
+dup2(log, STDOUT_FILENO); dup2(log, STDERR_FILENO); close(log);
+exit(mutate(pid, command, blob, root, fixture));
+```
+
+日志路径固定为 **`/mnt/mmc/nx300m-lut-worker-<pid>.log`**，`O_SYNC` 打开，
+所以**相机重启也不会丢**；SD 不可写时回退到 `/var/run/`。
+
+**结论**：以后排查 apply 一律先看这个文件，不要看 shell 的重定向。
+
+## 由此纠正的错误判断
+
+| 之前以为 | 实际 |
+|---|---|
+| apply 零输出 = 加载器没跑 | 输出一直在 worker 日志里 |
+| 相机重启 = poke 阶段崩 | 日志显示 poke 全部成功 |
+| 需要重编 loader 才能换 blob | 加 `--any-tag` 后 blob 可本地秒级迭代 |
+
+## 最新一次完整现场（setWidth 钩子）
+
+```
+STAGE slot-commit
+colour setters: ccm=b59721f8 sat=b5973488
+stock effect resolved: b4b2ca8c (slot held b665cc3c)
+bridge bindings 27/24 effect=b665cc3c ccm=b59721f8 sat=b5973488
+setWidth hooked: slot=b69b9ddc orig=b668bd5c hook=839ef3fc
+Still target stop window: 0.570s ms; file verification ran before attach.
+<日志到此结束，没有 EXIT 行>
+```
+
+即：**安装完全成功，停止窗口也过了，死在恢复运行后的第一帧**。
+
+## 已排除
+
+| 假设 | 证据 |
+|---|---|
+| GOT 槽找错 | PLT 解码确认 `0x1cb7f0 → 0x48fddc` |
+| 入口偏移错 | `nx_lut_ram_setw = 0x23fc = w17`，一致 |
+| 钩子汇编错 | 反汇编为标准尾调用，`r0/r1` 不动 |
+| 写虚表/写 GOT 这一页有问题 | `--poke-only` 写回原值完全正常 |
+| 内存写计数越界 | 纯转发版本（不写内存）同样重启 |
+
+## 未完成
+
+「空函数体」实验（只证明能否跳进 blob 执行）因相机离线未完成。
+恢复后第一件事就是跑它——它能区分「跳进 blob 就死」还是「转发/读内存才死」。
+
+## 工具
+
+- `--any-tag`：跳过 blob tag 校验，blob 本地 zig 编完即可上机，无需 CI
+- `--nodisplay` / `--poke-only`：A/B 诊断开关（当前 setWidth 版本已不使用）
