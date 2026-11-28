@@ -475,3 +475,63 @@ step=7  ipcs_open=0  输入flush=0  YCC=0  begin=0  render=0  restore=0
 3. 接拍照让路
 4. 运行中切换 LUT
 5. 开机自动安装
+
+---
+
+# 附五：找到正确的挂载点（2026-11-28）
+
+## 结论：`CLiveviewNodeDisplayAdjust::Execute`
+
+这是**面板前最后一个节点**，普通 P/A/S/M 每帧都跑，**不需要任何滤镜、不需要伪造相机状态**，因此 **RAW 天然不受影响**。
+
+| 项 | 值 |
+|---|---|
+| 函数 | `CLiveviewNodeDisplayAdjust::Execute(CCapImage*, void*, unsigned)` |
+| 地址 | `0x1cb794`（0xe0 字节，与上游文档「224 字节」一致） |
+| 虚表 | `_ZTV26CLiveviewNodeDisplayAdjust` @ `0x38d3a8`，**Execute 在 word 7**（`+0x1c`） |
+| 虚表填充 | 文件里是零填充，运行时由重定位写入 → **必须运行时按值匹配定位槽位** |
+
+### 实测
+
+```
+display node hooked: slot=b68b73c4 orig=b66f5794 hook=839f2afc
+帧计数 = 204（相机完全正常）
+image = CCapImage*，头部：
+  +0x08 = 800 (stride)   +0x10 = 720 (w)   +0x14 = 480 (h)   +0x20 = 3 (格式)
+```
+
+**720×480 / stride 800 —— 与此前已验证 70 帧的 IPCS 事务几何完全一致。**
+
+## 三个挂死事故的真正原因（重要教训）
+
+1. **强制插入 SmartFilter 节点** → 节点缺工作区/回调，工作线程死等（上游文档 L127 已警告）
+2. **普通模式接管 `ADE_SmartFilter_YccProcess`** → 该函数在普通模式下不运行，我们的钩子却把调用吞了
+3. **钩 DisplayAdjust** → **我们自己写错了**：探针把「原厂 Execute 地址」从 `w[28]` 读，而
+   `w[28]` 实际存的是 `ipcs_color_correction_param`，于是把图像指针当色彩系数传过去 → 挂机
+
+修法：原厂 Execute 单独存 `backend[42]`。修复后 204 帧无异常。
+
+**教训：钩子里的每一个"原厂地址"都必须有独立、语义明确的槽位，不能复用别的用途。**
+
+## 已排除的路线（都有实测依据）
+
+| 路线 | 证据 |
+|---|---|
+| 强制 `GetSmartFilterMode` 返回滤镜模式 | 该 getter 只在 `Create` 时调一次；强插节点会挂 |
+| IPCM 色彩 setter（CCM / 饱和度） | 实测 0 次调用，图片向导不走这两个 setter |
+| 图片向导激活 SmartFilter 节点 | 实测 `smartFilter` 仍 0 次 |
+
+## 下一步
+
+在 DisplayAdjust 钩子里从 `CCapImage*` 构造 `ADE_Image`，再跑已验证的 IPCS 事务：
+
+1. 参照 `CLiveviewNodeSmartFilter::smartFilter`（`0x1d928c`）的构造过程：
+   它把 mode 映射为 ADE 效果号（**mode 0 → ADE 效果 10**），然后构造 `ADE_Image`
+2. 需要还原 `sADEImgSize` / `sADEYccAddr` / `sADEPixelType` 三个结构布局
+3. 平面地址可用 `CalcYccAddr(CCapImage*, ipcs_ycc_img_info&)` @ `0x16bf30` 计算
+4. **失败必须是"转发原厂、画面不变"**，绝不吞调用
+
+## 相机恢复要点
+
+- 注入全部在内存；**拔电池或重启即彻底清除**
+- 开机自动安装始终是禁用状态（`/mnt/mmc/nx300-lut/DISABLED`）
