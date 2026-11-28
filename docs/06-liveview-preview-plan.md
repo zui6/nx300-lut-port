@@ -535,3 +535,66 @@ image = CCapImage*，头部：
 
 - 注入全部在内存；**拔电池或重启即彻底清除**
 - 开机自动安装始终是禁用状态（`/mnt/mmc/nx300-lut/DISABLED`）
+
+---
+
+# 附六：从 CCapImage 取平面地址的配方（2026-11-28）
+
+## PLT 桩解码器（已可用，务必保存）
+
+NX300 的 `libcapture-fw-slpcam.so` 有 6890 个 PLT 桩。解码规则（ARM，`add ip` 两段 + `ldr pc` 写回形式）：
+
+| 指令 | 掩码 | 说明 |
+|---|---|---|
+| `add ip, pc, #imm12` | `0xe28fc000` | imm12 = `(rot<<8) \| imm8`，值 = `imm8 ROR (rot*2)` |
+| `add ip, ip, #imm12` | `0xe28cc000` | **注意 Rn=12，不是 pc** |
+| `ldr pc, [ip, #imm12]!` | `0xe5bcf000` | **写回形式带 W 位**，不是 `0xe59fc000` |
+
+```
+plt 起始 = 0x132c3c，大小 0x1430c
+桩间距 12 字节
+GOT = (stub_va + 8) + rot(imm_a) + rot(imm_b) + imm_c
+```
+
+校验样例：`0x13a918` → GOT `0x49037c`（`GetSmartFilterMode`）✓
+
+## smartFilter 的完整取址调用链（0x1d928c，长度 0x860）
+
+```text
+CCapImage::getWidth / getHeight        (0x1d93dc / 0x1d93ec)
+CCapImage::getGWidth                   (0x1d93fc)   步长
+CCapImage::getOffsetX                  (0x1d940c)
+CLiveviewCommon::GetAspectRatio        (0x1d9424)
+CLiveviewCommon::GetStreamMode         (0x1d9440)
+
+CCapImage::getBuffer                   (0x1d9568 → CCapBuffer*)
+CCapBuffer::getVirtAddress(uCAP_ADDR*) (0x1d9580 ← 平面虚拟地址在这里)
+CCapBuffer::getAddressType             (0x1d959c)
+CCapImage::getGWidth / getOffsetX / getOffsetY   (多处，算各平面偏移)
+memcpy                                 (0x1d93cc，填进 ADE 参数结构)
+```
+
+**结论：平面地址 = `CCapBuffer::getVirtAddress(&uCAP_ADDR)`，其余几何由 `getGWidth/getOffsetX/getOffsetY/getHeight` 组合。**
+我们的 DisplayAdjust 钩子可以完全复刻这段，把 `CCapImage` 的平面喂给已验证的 IPCS 事务。
+
+## 相关符号
+
+| 符号 | 地址 | 大小 |
+|---|---|---|
+| `CLiveviewNodeSmartFilter::Execute` | `0x1d8c0c` | 0x134 |
+| `CLiveviewNodeSmartFilter::Prepare` | `0x1d8b40` | 0xcc |
+| `CLiveviewNodeSmartFilter::smartFilter` | `0x1d928c` | 0x860 |
+| `CLiveviewNodeDisplayAdjust::Execute` | `0x1cb794` | 0xe0 |
+| `CCapImage::getBuffer` / `getGWidth` / `getOffsetX` / `getOffsetY` | 见上 | — |
+
+## 下一步（按顺序）
+
+1. 反汇编 `0x1d9500..0x1d9a00`，逐条记录 `sADEImgSize` / `sADEYccAddr` / `sADEPixelType` 三个结构的字段填充顺序
+2. 在 DisplayAdjust 钩子里复刻同序取址
+3. 先只记录取到的指针（不调用任何 IPCS），上机比对是否与 720×480/stride 800 一致
+4. 确认无误后，接 `ADE_Image` 构造 + 已验证的事务
+5. **任何一步失败都必须转发原厂，绝不吞调用**
+
+## 本地构建（2026-11-28 起）
+
+blob 可用 zig 本地编（约 1 秒），loader 仍需 CI。详见 `~/.dsh/AGENTS.md`。
