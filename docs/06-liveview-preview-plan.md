@@ -598,3 +598,51 @@ memcpy                                 (0x1d93cc，填进 ADE 参数结构)
 ## 本地构建（2026-11-28 起）
 
 blob 可用 zig 本地编（约 1 秒），loader 仍需 CI。详见 `~/.dsh/AGENTS.md`。
+
+---
+
+# 附七：平面偏移公式与帧率更正（2026-11-28）
+
+## 帧率更正（重要）
+
+此前记录的「2.5 FPS」只是最初版本的表现。用户实测：**优化后约 30 FPS**，仅比原厂略慢。
+
+**结论：每帧跑一次 IPCS 事务完全可承受，帧率不是这条路的障碍。**
+
+## 平面偏移公式（libcapture 0x1d9568..0x1d9720）
+
+`CCapBuffer::getAddressType() == 7`（虚拟地址模式）分支：
+
+```text
+Y  平面偏移 = offsetX + offsetY       * gWidth
+UV 平面偏移 = offsetX + (offsetY / 2) * gWidth
+```
+
+对应反汇编：
+
+```asm
+0x1d9568  CCapImage::getBuffer()
+0x1d9580  CCapBuffer::getVirtAddress(&uCAP_ADDR)   → 基址，存 [fp,-0x6c]
+0x1d959c  CCapBuffer::getAddressType()
+0x1d95a4  cmp  r3, 7                              → ==7 走虚拟地址分支
+0x1d95c0  getGWidth()
+0x1d95d0  getOffsetY()
+0x1d95d8  mul  r5 = offsetY * gWidth
+0x1d95e0  getOffsetX()
+0x1d95e8  add  r3 = r5 + offsetX                   → Y 偏移
+0x1d960c  lsr  r3 = offsetY >> 1
+0x1d9610  mul  r5 = (offsetY/2) * gWidth
+```
+
+与实测 stride 800 / 720×480 一致，是标准 YUV420 布局。
+
+## 仍需还原的部分
+
+| 结构 | 用途 | 状态 |
+|---|---|---|
+| `uCAP_ADDR` | `getVirtAddress` 的输出，哪个字段是地址 | 待查 |
+| `sADEImgSize` | 宽/高/步长 | 待查 |
+| `sADEYccAddr` | 三个平面地址 | 待查 |
+| `sADEPixelType` | 像素格式枚举 | 待查 |
+
+填充顺序在 `0x1d9568..0x1d9a00`，用附六的 PLT 解码器可继续逐条解析。
