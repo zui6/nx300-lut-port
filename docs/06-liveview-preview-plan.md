@@ -646,3 +646,53 @@ UV 平面偏移 = offsetX + (offsetY / 2) * gWidth
 | `sADEPixelType` | 像素格式枚举 | 待查 |
 
 填充顺序在 `0x1d9568..0x1d9a00`，用附六的 PLT 解码器可继续逐条解析。
+
+---
+
+# 附八：ADE_Image 构造参数布局（2026-11-28）
+
+## 完整调用序列（smartFilter 尾部）
+
+```text
+0x1d995c  getOffsetX()
+0x1d9960..0x1d99c8   逐个平面算偏移：base + off + image_offset
+0x1d99cc..0x1d99e0   sADEPixelType 三个字段 = 0, 1, 0
+0x1d99e4   r5 = fp-0x128                        ← this
+0x1d99ec..0x1d99fc   sADEYccAddr#1  (fp-0x90, 5 字) → sp+0x00
+0x1d9a00..0x1d9a14   sADEYccAddr#2  (fp-0xa4, 5 字) → sp+0x14
+0x1d9a18   [fp-0x2c]                            → sp+0x28   (unsigned)
+0x1d9a20..0x1d9a2c   sADEPixelType  (fp-0xb0, 3 字) → sp+0x2c
+0x1d9a30   r0 = this
+0x1d9a34   ldm fp-0x5c, {r1,r2,r3}              ← sADEImgSize 走寄存器
+0x1d9a3c   bl ADE_Image::ADE_Image(...)
+0x1d9a54   bl ADE_Image::RegFlushFunc(...)
+0x1d9a64   bl ADE_SmartFilter_YccProcess(eADE_MODE, ADE_Image*)
+```
+
+## 结构大小（从 AAPCS 传参反推，可靠）
+
+| 结构 | 大小 | 位置 |
+|---|---|---|
+| `sADEImgSize` | 12 B（3×u32） | `r1,r2,r3` |
+| `sADEYccAddr`（输入） | **20 B（5×u32）** | `sp+0x00` |
+| `sADEYccAddr`（输出） | **20 B（5×u32）** | `sp+0x14` |
+| `unsigned` | 4 B | `sp+0x28` |
+| `sADEPixelType` | 12 B（3×u32） | `sp+0x2c` |
+
+栈合计 56 B，与 `sp` 推进量吻合。
+
+## 已知字段
+
+- `sADEPixelType`：`0x1d99cc` 起写入 **0, 1, 0**
+- 每个 `sADEYccAddr` 的前 4 个平面地址由
+  `基址 + 平面偏移 + image_offset` 逐个相加得到（`0x1d9960..0x1d99c8`）
+- 平面偏移公式见附七
+
+## 下一步
+
+1. 追 `fp-0x5c`（sADEImgSize 三字）的写入点 → 确认宽/高/步长的顺序
+2. 追 `fp-0x90` 与 `fp-0xa4`（两个 sADEYccAddr 的 5 个字）→ 每个字是什么
+3. 追 `fp-0xb0`（sADEPixelType）除已知 0,1,0 外是否有其它写入
+4. 有了这三个表就能在 DisplayAdjust 钩子里原样构造
+
+**安全底线不变**：任一字段异常 → 直接转发原厂，不跑事务。
