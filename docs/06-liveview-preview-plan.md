@@ -820,3 +820,98 @@ Still target stop window: 0.570s ms; file verification ran before attach.
 
 - `--any-tag`：跳过 blob tag 校验，blob 本地 zig 编完即可上机，无需 CI
 - `--nodisplay` / `--poke-only`：A/B 诊断开关（当前 setWidth 版本已不使用）
+
+---
+
+# 附十一：交接总结（2026-11-28 收尾）
+
+## 目标
+
+NX300 1.45 **普通模式**取景实时 LUT，同时**保住 RAW**。
+
+## 已确证可用
+
+| 能力 | 证据 |
+|---|---|
+| 拍照 JPEG 带 LUT | 实机验证（main 分支，稳定版） |
+| 微型滤镜模式下取景 LUT | 实机验证，约 30 FPS |
+| 一键注入 / 恢复机制 | 稳定，apply 幂等 |
+| **普通模式每帧钩子** | `DisplayAdjust::Execute` 虚表钩子，**实测 204 帧、相机存活** |
+
+**最后一条是关键成果**：普通模式、无需滤镜、RAW 不受影响，且钩子拿得到 `CCapImage*`。
+
+## 当前卡点
+
+往那个钩子**里面加东西**就导致相机重启：
+
+1. 加 `CCapImage` getter 调用（`getWidth`/`getGBuffer` 等）→ 重启
+2. 改用 `CCapImage::setWidth` GOT 钩子 → 反而被调用 5 万次、参数是像素数据，说明钩错对象 → 重启
+
+**唯一验证过安全的是「只计数 + 转发」**。
+
+## 必须知道的三个坑
+
+### 1. apply 的输出不在终端
+
+`supervised_mutate` fork 子进程并把 stdout/stderr 重定向到
+
+```
+/mnt/mmc/nx300m-lut-worker-<pid>.log     （O_SYNC，重启不丢）
+```
+
+**只有最终 JSON 才回终端。** 排查永远先看这个文件。
+
+### 2. 重启后读内存是垃圾
+
+blob 只在内存里，重启即消失。**必须「安装 → 解析 region → 读计数」在同一会话内完成**，否则读到的是失效残留（曾误判为 5 万帧）。
+
+### 3. 路由器会断
+
+相机偶尔从路由器掉线，表现为「连接重置 / 相机无响应」，**极易误判为崩溃**。
+所有上机脚本都要能重连重试。
+
+## 已还原的关键参数
+
+| 项 | 值 |
+|---|---|
+| `CLiveviewNodeDisplayAdjust::Execute` | `0x1cb794`（0xe0 字节） |
+| 其虚表 | `_ZTV26CLiveviewNodeDisplayAdjust` @ `0x38d3a8`，**Execute 在 word 7** |
+| 虚表特性 | 文件里零填充，运行时由重定位写入 → **必须运行时按值匹配定位槽** |
+| `CLiveviewNodeSmartFilter::smartFilter` | `0x1d928c`（0x860），GOT `cap+0x490330` |
+| `CLiveviewPathListLiveview::Create` | `0x1ebb98`；模式 0..14 插入 SmartFilter，15 跳过 |
+| `sADEImgSize` | 12 字节 = {width, height, stride} |
+| `sADEYccAddr` | **20 字节**（×2：输入/输出） |
+| `sADEPixelType` | 12 字节 = {0, 1, 0} |
+| ADE 调用序 | ctor `0x1d9a3c` → RegFlushFunc `0x1d9a54` → YccProcess `0x1d9a64` |
+| 平面偏移 | Y = offsetX + offsetY·gWidth；UV = offsetX + (offsetY/2)·gWidth |
+| 显示节点图像几何 | stride 800、720×480、格式 3 |
+
+## 工具
+
+- zig：`D:\AndroidSdk\zig\zig-windows-x86_64-0.13.0\zig.exe`，环境变量 `NX_LUT_CC` 已配
+- blob **本地编译约 1 秒**：`python -X utf8 tools\build_lut_ram_blob.py --output-dir out-local`
+- loader 仍需 GitHub CI（zig 不支持它的动态链接 + `-fno-pic`）
+- **`--any-tag`**：跳过 blob tag 校验，改 blob 后不必重编 loader
+
+## 已排除的路线（均有实测依据）
+
+| 路线 | 证据 |
+|---|---|
+| 强制 `GetSmartFilterMode` 后插节点 | 节点缺工作区/回调，整机卡死 |
+| IPCM 色彩 setter（CCM/饱和度） | 图片向导下 0 次调用 |
+| 图片向导激活 SmartFilter 节点 | 实测 `smartFilter` 仍 0 次 |
+| 普通模式接管 `ADE_SmartFilter_YccProcess` | 该函数普通模式不运行，吞调用导致卡死 |
+
+## 下一步（按顺序）
+
+1. **回到已验证配置**：只保留 `DisplayAdjust` 虚表钩子，钩子里只计数 + 转发
+2. 确认稳定后，只加**纯读取**（dump `CCapImage` 头 24 字），不调用任何函数
+3. 从 dump 出的布局推出平面地址
+4. 构造 `ADE_Image` → 复用**已跑通 70 帧**的 IPCS 事务
+5. 底线不变：**任何一步失败都转发原厂，绝不吞调用**
+
+## 上游文档要点
+
+- `docs/LUT_LIVEVIEW.md`：宿主是原厂 Miniature；「RAW 菜单限制仍待处理」
+- `docs/SMARTFILTER_LUT_PREVIEW.md` L68/L127/L309：关闭滤镜时的节点插入与工作区**未解决**
+- 即：**「普通模式 + RAW」是上游也没做到的部分**，属于我们的原创工作
